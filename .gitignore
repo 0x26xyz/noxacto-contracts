@@ -1,0 +1,15 @@
+# foundry build output
+out/
+cache/
+
+# deploy artifacts (tx logs + resolved addresses — keep local)
+broadcast/
+
+# secrets & local env — NEVER commit real keys. Ship .env.example only.
+.env
+.env.*
+!.env.example
+
+# misc
+node_modules/
+.DS_Store
