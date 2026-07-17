@@ -3,8 +3,6 @@
 Solidity contracts for the **NOXA ⇄ wNOXA** federated lock-and-mint bridge
 (DBK Chain ⇄ Robinhood Chain). Foundry project.
 
-> Proprietary — BUSL-1.1 (see the SPDX header in each source file). Not open source.
-
 ## Contracts
 
 **Hardened (v2) — current:**
@@ -51,3 +49,7 @@ Federated / custodial bridge: the authority key is the trust anchor for mint (RH
 unlock (DBK). The hardening bounds the blast radius of a compromised hot key (cap,
 pause, rate-limited unlock, cold/hot role split) but does not make it trustless. Move
 ownership to a multisig and monitor `NOXA.balanceOf(lockbox) >= wNOXA.totalSupply()`.
+
+## License
+
+[MIT](LICENSE).
