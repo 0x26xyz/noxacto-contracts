@@ -26,7 +26,10 @@ contract NoxaLockboxManagerTest is Test {
     function setUp() public {
         vm.warp(1_700_000_000);
         noxa = new MaxWalletNoxa(noxaOwner, CAP, 1_000_000 ether);
-        mgr = new NoxaLockboxManager(address(noxa), wnoxa, owner, unlocker, CAP, VCAP, CCAP, WINDOW);
+        // Shared fixture runs with the burn fee OFF so the routing/rate-limit
+        // tests keep exact-amount expectations; the fee suite below deploys its
+        // own 1% manager.
+        mgr = new NoxaLockboxManager(address(noxa), wnoxa, owner, unlocker, CAP, VCAP, CCAP, WINDOW, 0);
         // A funded "faucet" that stands in for many users (excluded FIRST so it
         // can hold and lock arbitrary aggregate amounts through the manager).
         vm.prank(noxaOwner);
@@ -269,9 +272,9 @@ contract NoxaLockboxManagerTest is Test {
 
     function test_constructor_rejectsZeros() public {
         vm.expectRevert(NoxaLockboxManager.ZeroAmount.selector);
-        new NoxaLockboxManager(address(noxa), wnoxa, owner, unlocker, 0, VCAP, CCAP, WINDOW);
+        new NoxaLockboxManager(address(noxa), wnoxa, owner, unlocker, 0, VCAP, CCAP, WINDOW, 0);
         vm.expectRevert(NoxaLockboxManager.ZeroAddress.selector);
-        new NoxaLockboxManager(address(0), wnoxa, owner, unlocker, CAP, VCAP, CCAP, WINDOW);
+        new NoxaLockboxManager(address(0), wnoxa, owner, unlocker, CAP, VCAP, CCAP, WINDOW, 0);
     }
 
     function test_box_constructor_rejectsZero() public {
@@ -552,6 +555,116 @@ contract NoxaLockboxManagerTest is Test {
         vm.expectRevert(abi.encodeWithSelector(NoxaLockboxManager.BadRange.selector, 0, 65));
         mgr.spawnBoxes(65);
         vm.stopPrank();
+    }
+
+    // ---- bridge burn fee: lock skims bridgeFeeBps of every deposit to DEAD ----
+
+    address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
+    /// Deploy a fee-charging manager. DEAD is excluded from the mock's wallet
+    /// cap, mirroring the real NOXA (DEAD is excluded on-chain — it holds the
+    /// team's 400K burn), so the skim transfer can never cap-revert.
+    function _feeMgr(uint256 bps) internal returns (NoxaLockboxManager m) {
+        m = new NoxaLockboxManager(address(noxa), wnoxa, owner, unlocker, CAP, VCAP, CCAP, WINDOW, bps);
+        noxa.approve(address(m), type(uint256).max);
+        vm.prank(noxaOwner);
+        noxa.setExcluded(DEAD, true);
+    }
+
+    function test_burnFee_skimsToDead_emitsNetLocked() public {
+        NoxaLockboxManager m = _feeMgr(100); // 1%
+        assertEq(m.bridgeFeeBps(), 100);
+
+        vm.expectEmit(true, true, true, true);
+        emit NoxaLockboxManager.Locked(0, address(this), bob, 9_900 ether); // NET amount
+        vm.expectEmit(true, false, false, true);
+        emit NoxaLockboxManager.BridgeFeeBurned(0, 100 ether);
+        (uint256 nonce, uint256 received) = m.lock(10_000 ether, bob);
+
+        assertEq(nonce, 0);
+        assertEq(received, 9_900 ether); // what RH mints
+        assertEq(noxa.balanceOf(m.boxes(0)), 9_900 ether); // vaulted == minted (peg)
+        assertEq(m.totalCollateral(), 9_900 ether);
+        assertEq(noxa.balanceOf(DEAD), 100 ether); // 1% burned on DBK, same tx
+    }
+
+    function test_burnFee_exactCapDeposit() public {
+        NoxaLockboxManager m = _feeMgr(100);
+        (, uint256 received) = m.lock(CAP, bob); // 25k fits the fresh shard pre-skim
+        assertEq(received, CAP - CAP / 100);
+        assertEq(noxa.balanceOf(m.boxes(0)), CAP - CAP / 100);
+        assertEq(noxa.balanceOf(DEAD), CAP / 100);
+    }
+
+    function test_burnFee_dustRoundsDownToZero() public {
+        NoxaLockboxManager m = _feeMgr(100);
+        (, uint256 received) = m.lock(99, bob); // 99 wei * 1% rounds to 0
+        assertEq(received, 99);
+        assertEq(noxa.balanceOf(DEAD), 0); // no skim, no BridgeFeeBurned
+        assertEq(m.totalCollateral(), 99);
+    }
+
+    function test_burnFee_composesWithSourceFeeOnTransfer() public {
+        NoxaLockboxManager m = _feeMgr(100); // 1% bridge burn fee
+        vm.prank(noxaOwner);
+        noxa.setFee(100); // + 1% source-token FoT (routed to the mock's SINK == DEAD)
+
+        (, uint256 received) = m.lock(10_000 ether, bob);
+        // Shard books 9_900 after the source FoT; the bridge fee is 1% of THAT.
+        assertEq(received, 9_900 ether - 99 ether);
+        assertEq(noxa.balanceOf(m.boxes(0)), 9_801 ether); // vaulted == minted
+        assertEq(m.totalCollateral(), 9_801 ether);
+    }
+
+    function test_burnFee_collateralAlwaysMatchesMintedSum() public {
+        NoxaLockboxManager m = _feeMgr(100);
+        uint256 minted;
+        uint256[4] memory amts = [uint256(25_000 ether), 13 ether, 24_999 ether, 1];
+        for (uint256 i = 0; i < 4; i++) {
+            (, uint256 received) = m.lock(amts[i], bob);
+            minted += received;
+        }
+        // The relayer mints exactly `received` per lock; collateral must cover it.
+        assertEq(m.totalCollateral(), minted);
+    }
+
+    function test_burnFee_setterCeilingOwnerAndDisable() public {
+        NoxaLockboxManager m = _feeMgr(100);
+
+        // Constructor ceiling.
+        vm.expectRevert(abi.encodeWithSelector(NoxaLockboxManager.FeeTooHigh.selector, 201, 200));
+        new NoxaLockboxManager(address(noxa), wnoxa, owner, unlocker, CAP, VCAP, CCAP, WINDOW, 201);
+
+        // Setter: owner-only, same ceiling.
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, bob));
+        vm.prank(bob);
+        m.setBridgeFeeBps(50);
+        vm.expectRevert(abi.encodeWithSelector(NoxaLockboxManager.FeeTooHigh.selector, 201, 200));
+        vm.prank(owner);
+        m.setBridgeFeeBps(201);
+
+        // Max allowed works; 0 disables (escape hatch).
+        vm.prank(owner);
+        m.setBridgeFeeBps(200);
+        assertEq(m.bridgeFeeBps(), 200);
+        vm.prank(owner);
+        m.setBridgeFeeBps(0);
+        (, uint256 received) = m.lock(10_000 ether, bob);
+        assertEq(received, 10_000 ether); // no skim once disabled
+        assertEq(noxa.balanceOf(DEAD), 0);
+    }
+
+    /// Fuzz: for any fee ≤ ceiling and any deposit, vaulted collateral equals the
+    /// emitted (mintable) amount and fee + net add back up to what the shard got.
+    function testFuzz_burnFee_conservation(uint256 bps, uint256 amount) public {
+        bps = bps % 201; // 0..MAX_BRIDGE_FEE_BPS
+        amount = 1 + (amount % CAP);
+        NoxaLockboxManager m = _feeMgr(bps);
+        (, uint256 received) = m.lock(amount, bob);
+        uint256 fee = (amount * bps) / 10_000;
+        assertEq(received, amount - fee);
+        assertEq(m.totalCollateral(), received);
+        assertEq(noxa.balanceOf(DEAD), fee);
     }
 
     // ---- fuzz: routing keeps shards under cap; collateral is conserved ----

@@ -35,6 +35,17 @@ import {NoxaShardedBox} from "./NoxaShardedBox.sol";
 ///   the replay guard + rate limit meter the total, not per box.
 /// - **Recoverable replay guard, batched.** `clearProcessedBurn(s)` /
 ///   `clearProcessedBurnRange` for pause-first recovery, exactly as V3.
+/// - **Bridge burn fee — the community buyback-and-burn, contract-enforced.**
+///   `lock` skims `bridgeFeeBps` of every custodied deposit (100 = 1% at launch;
+///   owner-tunable, hard-capped at `MAX_BRIDGE_FEE_BPS`; 0 disables) straight
+///   from the shard to the DEAD address on DBK — real NOXA leaves circulation in
+///   the same transaction, with no swap, keeper, or relayer dependency (unlike
+///   the LP-fee `NoxaFeeBurner` flywheel, which only earns on pool TRADING
+///   volume). `Locked` emits the NET amount, so RH mints exactly the collateral
+///   that remains vaulted and the peg invariant is untouched. DEAD is excluded
+///   from the source wallet cap (verified — it already holds the team's 400K
+///   burn), so the skim transfer cannot cap-revert; if it ever did, setting the
+///   fee to 0 restores `lock` without a redeploy.
 ///
 /// Collateral invariant (relayer-enforced off-chain): `totalCollateral()` (the
 /// sum over all shards) + migrator escrow >= wNOXA.totalSupply(). Renounce stays
@@ -42,10 +53,24 @@ import {NoxaShardedBox} from "./NoxaShardedBox.sol";
 contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     using SafeERC20 for IERC20;
 
+    /// @notice Standard burn sink on DBK — NOXA sent here leaves circulation.
+    /// Cap-excluded on the source token (it holds the team's 400K burn).
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    /// @notice Hard ceiling on `bridgeFeeBps` (2%) — bounds the owner's knob so
+    /// the fee can never be turned into a confiscatory rake.
+    uint256 public constant MAX_BRIDGE_FEE_BPS = 200;
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+
     /// @notice The DBK-Chain NOXA token being custodied.
     IERC20 public immutable noxa;
     /// @notice The RH wNOXA this manager settles for (informational; relayer-enforced).
     address public immutable wrappedNoxa;
+
+    /// @notice Inbound bridge fee in bps of the custodied (post-source-FoT)
+    /// amount, burned to DEAD inside `lock`. 0 disables (also the escape hatch
+    /// if the DEAD transfer ever starts reverting). Never exceeds
+    /// `MAX_BRIDGE_FEE_BPS`.
+    uint256 public bridgeFeeBps;
 
     /// @notice Per-box fill ceiling — the source token's max-wallet cap. A box is
     /// never filled past this (NOXA would revert the transfer). Owner-settable to
@@ -109,6 +134,12 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     /// @param rhBurnNonce The RH `BurnedForReturn` nonce this release settles.
     /// @param viaOwner True if released through the uncapped owner path.
     event Unlocked(uint256 indexed rhBurnNonce, address indexed to, uint256 amount, bool viaOwner);
+    event BridgeFeeSet(uint256 bps);
+    /// @notice Real NOXA skimmed from lock `nonce`'s deposit and sent to DEAD.
+    /// `amount` is what left the shard; under NOXA's own fee-on-transfer the DEAD
+    /// address may book slightly less, with the difference going to NOXA's fee
+    /// sink — either way it all leaves circulation (same caveat as NoxaFeeBurner).
+    event BridgeFeeBurned(uint256 indexed nonce, uint256 amount);
 
     error ZeroAddress();
     error ZeroAmount();
@@ -124,6 +155,7 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     error BoxSpawnBlocked();
     error CannotRescueCollateral();
     error RenounceDisabled();
+    error FeeTooHigh(uint256 bps, uint256 max);
 
     /// @param noxa_ DBK NOXA token.
     /// @param wrappedNoxa_ RH wNOXA this manager settles for (recorded only).
@@ -133,6 +165,8 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     /// @param unlockCapPerWindow_ Hot-path per-window value budget. Non-zero.
     /// @param unlockCountPerWindow_ Hot-path per-window settlement-count budget. Non-zero.
     /// @param unlockWindow_ Leaky-bucket decay length (seconds). Non-zero.
+    /// @param bridgeFeeBps_ Inbound burn fee in bps (100 = 1% at launch). May be 0
+    ///        (fee disabled); must not exceed `MAX_BRIDGE_FEE_BPS`.
     constructor(
         address noxa_,
         address wrappedNoxa_,
@@ -141,12 +175,14 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         uint256 maxBoxAmount_,
         uint256 unlockCapPerWindow_,
         uint256 unlockCountPerWindow_,
-        uint256 unlockWindow_
+        uint256 unlockWindow_,
+        uint256 bridgeFeeBps_
     ) Ownable(bridgeAuthority_) {
         if (noxa_ == address(0) || wrappedNoxa_ == address(0)) revert ZeroAddress();
         if (maxBoxAmount_ == 0 || unlockCapPerWindow_ == 0 || unlockCountPerWindow_ == 0 || unlockWindow_ == 0) {
             revert ZeroAmount();
         }
+        if (bridgeFeeBps_ > MAX_BRIDGE_FEE_BPS) revert FeeTooHigh(bridgeFeeBps_, MAX_BRIDGE_FEE_BPS);
         noxa = IERC20(noxa_);
         wrappedNoxa = wrappedNoxa_;
         maxBoxAmount = maxBoxAmount_;
@@ -154,12 +190,14 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         unlockCapPerWindow = unlockCapPerWindow_;
         unlockCountPerWindow = unlockCountPerWindow_;
         unlockWindow = unlockWindow_;
+        bridgeFeeBps = bridgeFeeBps_;
         lastUnlockAt = block.timestamp;
         emit MaxBoxAmountSet(maxBoxAmount_);
         emit UnlockerSet(unlocker_);
         emit UnlockCapPerWindowSet(unlockCapPerWindow_);
         emit UnlockCountPerWindowSet(unlockCountPerWindow_);
         emit UnlockWindowSet(unlockWindow_);
+        emit BridgeFeeSet(bridgeFeeBps_);
     }
 
     // -----------------------------------------------------------------------
@@ -216,6 +254,15 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         if (amount_ == 0) revert ZeroAmount();
         maxBoxAmount = amount_;
         emit MaxBoxAmountSet(amount_);
+    }
+
+    /// @notice Tune the inbound burn fee. Hard-capped at `MAX_BRIDGE_FEE_BPS`
+    /// (2%); 0 disables the fee entirely (also the recovery lever should the
+    /// DEAD transfer ever start reverting). Owner (Safe) only.
+    function setBridgeFeeBps(uint256 bps) external onlyOwner {
+        if (bps > MAX_BRIDGE_FEE_BPS) revert FeeTooHigh(bps, MAX_BRIDGE_FEE_BPS);
+        bridgeFeeBps = bps;
+        emit BridgeFeeSet(bps);
     }
 
     function clearProcessedBurn(uint256 rhBurnNonce) external onlyOwner {
@@ -305,8 +352,13 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
 
     /// @notice Lock NOXA to bridge it to Robinhood Chain. Pulls from the caller,
     /// routes it into a shard with headroom (spawning a fresh shard if the active
-    /// one is too full), and emits a single global `Locked`. Fee-on-transfer safe
-    /// on both hops. The manager holds NOXA only within this call.
+    /// one is too full), skims the `bridgeFeeBps` burn fee straight to DEAD, and
+    /// emits a single global `Locked` with the NET amount — the relayer mints
+    /// exactly what remains vaulted. Fee-on-transfer safe on both hops. The
+    /// manager holds NOXA only within this call.
+    /// @return nonce Global inbound lock nonce consumed by the RH mint.
+    /// @return received NET amount custodied (post source-FoT, post burn fee) —
+    ///         the amount minted on RH.
     function lock(uint256 amount, address rhRecipient)
         external
         nonReentrant
@@ -331,9 +383,22 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         received = noxa.balanceOf(box) - box0; // fee-on-transfer safe, single hop
         if (received == 0) revert NothingReceived();
 
+        // Burn fee: skim bridgeFeeBps of the custodied amount from the shard
+        // straight to DEAD — real NOXA leaves circulation in this same tx. The
+        // shard's balance drops by exactly `burnFee` (sender-side), so the net
+        // `received` emitted below equals the collateral actually vaulted and
+        // the peg invariant is untouched. Rounds down (dust locks skim 0); the
+        // fee can never consume the whole deposit (bps ceiling is 2%).
+        uint256 burnFee = (received * bridgeFeeBps) / BPS_DENOMINATOR;
+        if (burnFee != 0) {
+            NoxaShardedBox(box).drain(DEAD, burnFee);
+            received -= burnFee;
+        }
+
         nonce = lockNonce++;
         emit Locked(nonce, msg.sender, rhRecipient, received);
         emit LockRouted(nonce, box);
+        if (burnFee != 0) emit BridgeFeeBurned(nonce, burnFee);
     }
 
     /// @dev Return the active shard if `amount` fits under the cap, else spawn

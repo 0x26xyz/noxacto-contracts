@@ -102,6 +102,19 @@ UI likewise. NOT yet deployed. Known residual: the outbound recipient-cap wedge
 (a DBK recipient already near their own 25K cap) is still relayer policy — the
 relayer must skip-and-continue so one wedged burn doesn't head-of-line block.
 
+**Bridge burn fee (added 2026-07-22).** `lock` skims `bridgeFeeBps` of every
+custodied deposit (launch: 100 = 1%; owner-tunable, hard ceiling
+`MAX_BRIDGE_FEE_BPS` = 2%; 0 disables) from the shard straight to DEAD on DBK —
+real NOXA leaves circulation in the same transaction. This is the community
+buyback-and-burn, contract-enforced on BRIDGE volume; the LP-fee `NoxaFeeBurner`
+flywheel (which only earns on pool TRADING volume) remains as a complement.
+`Locked` emits the NET amount, so the relayer mints exactly the vaulted
+collateral and the peg invariant is unchanged. DEAD is cap-excluded on the
+source token (verified §1 — it holds the team's 400K burn), so the skim cannot
+cap-revert; if it ever did, `setBridgeFeeBps(0)` restores `lock` without a
+redeploy. Relayer/UI: quote the net amount ("you will receive X on RH, 1% burn
+fee") — the `Locked` event needs no decoder change.
+
 ### 4.1 `NoxaLockboxFactory` (DBK) — SUPERSEDED by NoxaLockboxManager (built)
 
 - Deploys `NoxaLockboxV2`-style boxes at deterministic CREATE2 addresses;
