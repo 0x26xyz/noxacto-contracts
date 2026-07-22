@@ -471,18 +471,54 @@ contract NoxaLockboxManagerTest is Test {
 
     function test_rescueBoxToken_nonNoxaOnly() public {
         _lock(1_000 ether, bob);
-        address box = mgr.boxes(0);
         // stray non-NOXA on a shard
         MaxWalletNoxa stray = new MaxWalletNoxa(address(this), type(uint256).max, 1_000 ether);
-        stray.transfer(box, 500 ether);
+        stray.transfer(mgr.boxes(0), 500 ether);
 
         vm.expectRevert(NoxaLockboxManager.CannotRescueCollateral.selector);
         vm.prank(owner);
-        mgr.rescueBoxToken(box, address(noxa), bob, 1 ether); // NOXA blocked
+        mgr.rescueBoxToken(0, address(noxa), bob, 1 ether); // NOXA blocked
 
         vm.prank(owner);
-        mgr.rescueBoxToken(box, address(stray), bob, 500 ether);
+        mgr.rescueBoxToken(0, address(stray), bob, 500 ether);
         assertEq(stray.balanceOf(bob), 500 ether);
+    }
+
+    // ---- review (re-pass, LOW): the all-slots-poisoned case + owner recovery ----
+
+    function test_poison_allSpawnSlots_ownerRecovers() public {
+        _lock(CAP, bob); // box0 filled; next CREATE is at manager nonce 2
+        // Poison the next MAX_SPAWNS_PER_LOCK spawn addresses with 1 wei each.
+        uint256 max = mgr.MAX_SPAWNS_PER_LOCK();
+        for (uint256 i = 0; i < max; i++) {
+            vm.prank(noxaOwner);
+            noxa.transfer(vm.computeCreateAddress(address(mgr), 2 + i), 1);
+        }
+        // An EXACTLY-cap lock is blocked (a fresh shard needs balance 0, but all are 1 wei).
+        vm.expectRevert(NoxaLockboxManager.BoxSpawnBlocked.selector);
+        _lock(CAP, bob);
+
+        // But a sub-cap lock routes through a poisoned shard normally (the workaround).
+        (, uint256 recvd) = _lock(CAP - 1, bob);
+        assertEq(recvd, CAP - 1);
+
+        // Owner clears the frontier: spawnBoxes absorbs the poison as collateral.
+        vm.prank(owner);
+        mgr.spawnBoxes(max);
+        // Now an exactly-cap lock succeeds again (spawns a fresh, un-poisoned shard).
+        (, uint256 recvd2) = _lock(CAP, bob);
+        assertEq(recvd2, CAP);
+    }
+
+    function test_spawnBoxes_boundedAndOwnerOnly() public {
+        vm.expectRevert(); // onlyOwner
+        mgr.spawnBoxes(1);
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NoxaLockboxManager.BadRange.selector, 0, 0));
+        mgr.spawnBoxes(0);
+        vm.expectRevert(abi.encodeWithSelector(NoxaLockboxManager.BadRange.selector, 0, 65));
+        mgr.spawnBoxes(65);
+        vm.stopPrank();
     }
 
     // ---- fuzz: routing keeps shards under cap; collateral is conserved ----

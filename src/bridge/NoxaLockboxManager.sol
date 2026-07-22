@@ -67,6 +67,8 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     /// @notice Max fresh shards a single `lock` will spawn past pre-funded (poison)
     /// addresses before deferring to the owner's `spawnBoxes` escape hatch.
     uint256 public constant MAX_SPAWNS_PER_LOCK = 8;
+    /// @notice Per-call bound on the owner's `spawnBoxes` recovery.
+    uint256 public constant MAX_SPAWN_BATCH = 64;
 
     /// @notice Hot key allowed to call the rate-limited `unlock`. Rotatable by owner.
     address public unlocker;
@@ -246,13 +248,16 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         }
     }
 
-    /// @notice Recover a NON-NOXA ERC-20 that landed on a shard (airdrop / mistaken
-    /// transfer). Cannot move the custodied NOXA (that would break the peg). Owner
-    /// only. Restores the `NoxaLockboxV3.rescueToken` capability the fleet lost.
-    function rescueBoxToken(address box, address token, address to, uint256 amount) external onlyOwner {
+    /// @notice Recover a NON-NOXA ERC-20 that landed on shard `index` (airdrop /
+    /// mistaken transfer). Cannot move the custodied NOXA (that would break the
+    /// peg). Owner only. Restores `NoxaLockboxV3.rescueToken`. Index-based (like
+    /// `ownerDrainShard`) so a mistyped shard address can't send tokens astray.
+    function rescueBoxToken(uint256 index, address token, address to, uint256 amount) external onlyOwner {
+        if (index >= boxes.length) revert BadRange(index, boxes.length);
         if (token == address(noxa)) revert CannotRescueCollateral();
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
+        address box = boxes[index];
         NoxaShardedBox(box).rescueToken(token, to, amount);
         emit TokenRescued(box, token, to, amount);
     }
@@ -318,15 +323,21 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
 
     /// @dev Return the active shard if `amount` fits under the cap, else spawn
     /// fresh shards until one has headroom. A spawn address is a plain CREATE
-    /// (deterministic from the manager nonce), so an attacker can PRE-FUND it to
-    /// the cap; that would make forwarding revert forever at the same address
-    /// (a reverted lock never consumes the nonce). Defence: each spawned shard is
-    /// RECORDED before the headroom check, so a poisoned shard's donation becomes
-    /// real, drainable collateral and the loop advances to the next (un-poisoned)
-    /// address — the attack now costs a full cap per blocked spawn, gifted to the
-    /// protocol. Bounded by `MAX_SPAWNS_PER_LOCK`; if an attacker poisons that many
-    /// consecutive addresses (locking up cap x that many NOXA), `spawnBoxes` is the
-    /// owner's escape hatch to skip past them.
+    /// (deterministic from the manager nonce), so an attacker can PRE-FUND it —
+    /// even 1 wei is enough to fail the headroom check for an exactly-cap deposit,
+    /// since `balance + amount <= maxBoxAmount` then requires balance == 0. Defence
+    /// on the SUCCESS path: each spawned shard is RECORDED before the check, so a
+    /// poisoned shard's donation becomes drainable collateral and the loop advances
+    /// past it. LIMIT (review, LOW): if ALL `MAX_SPAWNS_PER_LOCK` consecutive spawn
+    /// addresses are poisoned, this reverts `BoxSpawnBlocked` and the revert ROLLS
+    /// BACK the records — nothing is absorbed, and the poison persists. Impact is
+    /// bounded: 1-wei poison blocks ONLY exactly-cap locks (a user locks cap-minus-
+    /// dust and succeeds; sub-cap locks route through poisoned shards normally), and
+    /// blocking a wider band costs the attacker proportional, forfeitable NOXA. The
+    /// owner clears it with `spawnBoxes` (which absorbs the poison and advances the
+    /// frontier). NOT made permissionless deliberately: that would let a griefer
+    /// bloat `boxes[]` with empty trailing shards and gas-DoS `totalCollateral()`
+    /// (summed every tick by the relayer), which the cursor does NOT skip.
     function _boxWithHeadroom(uint256 amount) internal returns (address box) {
         uint256 n = boxes.length;
         if (n != 0) {
@@ -360,10 +371,14 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         emit BoxSpawned(idx, box);
     }
 
-    /// @notice Owner escape hatch: pre-spawn `count` shards, skipping past any
-    /// pre-funded (poisoned) addresses so `lock` can resume. Each spawned shard is
-    /// registered; a poisoned one becomes drainable collateral. Owner only.
+    /// @notice Owner escape hatch for the poison-spawn grief: pre-spawn `count`
+    /// shards, skipping past pre-funded (poisoned) addresses so `lock` can resume.
+    /// Each spawned shard is registered; a poisoned one becomes drainable collateral
+    /// (recover it with `ownerDrainShard`). Owner-only ON PURPOSE — a permissionless
+    /// version would let a griefer bloat `boxes[]` with empty shards and gas-DoS the
+    /// per-tick `totalCollateral()`. Bounded per call.
     function spawnBoxes(uint256 count) external onlyOwner {
+        if (count == 0 || count > MAX_SPAWN_BATCH) revert BadRange(0, count);
         for (uint256 i = 0; i < count; i++) {
             _spawn();
         }
