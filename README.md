@@ -50,6 +50,17 @@ unlock (DBK). The hardening bounds the blast radius of a compromised hot key (ca
 pause, rate-limited unlock, cold/hot role split) but does not make it trustless. Move
 ownership to a multisig and monitor `NOXA.balanceOf(lockbox) >= wNOXA.totalSupply()`.
 
+## ⚠️ Known open constraint: NOXA 25K wallet cap
+
+Source NOXA reportedly enforces a **25,000 max balance per address** (unverified
+on-chain; corroborated by community sources). The lockbox is a single custody
+address and has **no handling for this** — if the cap is real and applies to the
+lockbox, total bridged collateral is hard-capped at 25K NOXA (2.5% of supply).
+The NOXA team is unreachable, so no exemption can be requested. Verification
+steps, decision tree, and the sharded-custody + mirrored-cap design are in
+[`docs/noxa-wallet-cap.md`](docs/noxa-wallet-cap.md). **Run the verification
+before relying on this bridge for meaningful volume.**
+
 ## License
 
 [MIT](LICENSE).
