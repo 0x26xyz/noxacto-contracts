@@ -46,10 +46,12 @@ contract WNoxaMigrator is ReentrancyGuard, Ownable2Step, Pausable {
 
     event Migrated(address indexed account, uint256 amount);
     event EscrowSwept(address indexed to, uint256 amount);
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
 
     error ZeroAddress();
     error ZeroAmount();
     error NothingReceived();
+    error CannotRescueEscrow();
     error RenounceDisabled();
 
     /// @param oldToken_ The deprecated wNOXA to escrow.
@@ -85,6 +87,19 @@ contract WNoxaMigrator is ReentrancyGuard, Ownable2Step, Pausable {
         if (to == address(0)) revert ZeroAddress();
         oldToken.safeTransfer(to, amount);
         emit EscrowSwept(to, amount);
+    }
+
+    /// @notice Recover any token OTHER than the escrowed `oldToken` that lands here
+    /// — most importantly the NEW wNOXA if it is mistakenly sent to the migrator
+    /// during the cutover window, or any airdrop. The escrowed old token is
+    /// deliberately carved out: it backs the new supply this migrator minted and
+    /// has its own dedicated reconciliation path (`sweepEscrow`). Owner (Safe) only.
+    function rescueToken(address token, address to, uint256 amount) external onlyOwner {
+        if (token == address(oldToken)) revert CannotRescueEscrow();
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        IERC20(token).safeTransfer(to, amount);
+        emit TokenRescued(token, to, amount);
     }
 
     function pause() external onlyOwner {

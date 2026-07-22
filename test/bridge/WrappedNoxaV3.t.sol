@@ -9,6 +9,7 @@ import {ERC20Capped} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20C
 import {WrappedNoxaV2} from "../../src/bridge/WrappedNoxaV2.sol";
 import {WrappedNoxaV3} from "../../src/bridge/WrappedNoxaV3.sol";
 import {WNoxaMigrator} from "../../src/bridge/WNoxaMigrator.sol";
+import {MockERC20} from "../mocks/MockERC20.sol";
 
 contract WrappedNoxaV3Test is Test {
     uint256 constant CAP = 1_000_000 ether; // source NOXA total supply
@@ -546,6 +547,35 @@ contract WrappedNoxaV3Test is Test {
         assertEq(oldT.balanceOf(alice), 10_000 ether);
     }
 
+    /// audit: the new wNOXA (or any non-escrow token) mistakenly sent to the
+    /// migrator during cutover is recoverable; the escrowed OLD token is carved
+    /// out (it backs the minted supply and exits only via `sweepEscrow`).
+    function test_migrator_rescueToken_excludesEscrowedOldToken() public {
+        (WrappedNoxaV2 oldT, WNoxaMigrator mig) = _deployMigration();
+        vm.prank(minter);
+        oldT.mint(alice, 100 ether, 0);
+        vm.startPrank(alice);
+        oldT.approve(address(mig), 100 ether);
+        mig.migrate(100 ether); // 100 old escrowed
+        vm.stopPrank();
+
+        // The escrowed old token is NOT sweepable via the general rescue.
+        vm.prank(owner);
+        vm.expectRevert(WNoxaMigrator.CannotRescueEscrow.selector);
+        mig.rescueToken(address(oldT), owner, 1 ether);
+
+        // New wNOXA fat-fingered into the migrator: recoverable, owner only.
+        _mint(address(mig), 500 ether, 900);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        mig.rescueToken(address(wnoxa), bob, 500 ether);
+
+        vm.prank(owner);
+        mig.rescueToken(address(wnoxa), bob, 500 ether);
+        assertEq(wnoxa.balanceOf(bob), 500 ether);
+        assertEq(oldT.balanceOf(address(mig)), 100 ether); // escrow untouched
+    }
+
     // =======================================================================
     // Zero-guard revert paths
     // =======================================================================
@@ -620,5 +650,73 @@ contract WrappedNoxaV3Test is Test {
             wnoxa.transfer(bob, amount);
             assertEq(wnoxa.balanceOf(bob), toPre + amount);
         }
+    }
+
+    // =======================================================================
+    // Escrow dormancy: a no-op claim by a capped holder is still activity (audit)
+    // =======================================================================
+
+    /// The live-code bug: `claim()` early-returned when a capped holder had no
+    /// headroom, BEFORE the dormancy-clock refresh — so their claim attempt didn't
+    /// count as activity and the owner could seize their escrow via `rescueEscrow`
+    /// after 7 days. Fixed: a claim attempt by an account that still holds escrow
+    /// refreshes the clock even when it releases nothing, so a live holder's escrow
+    /// is never rescuable out from under them.
+    function test_claim_noopAtCap_refreshesDormancyClock() public {
+        _escrowForAlice(MAX_WALLET, 10_000 ether); // alice AT cap, 10K escrowed
+        uint256 t0 = wnoxa.claimableSince(alice);
+        assertEq(t0, block.timestamp);
+
+        // Almost the whole window elapses with alice still capped (cannot claim).
+        vm.warp(t0 + wnoxa.ESCROW_RESCUE_DELAY() - 1);
+        vm.expectRevert(abi.encodeWithSelector(WrappedNoxaV3.EscrowNotDormant.selector, alice));
+        vm.prank(owner);
+        wnoxa.rescueEscrow(alice, bob, 1 ether);
+
+        // Alice calls claim(): she is at cap, so it releases nothing (no-op)...
+        vm.prank(alice);
+        assertEq(wnoxa.claim(), 0);
+        assertEq(wnoxa.claimable(alice), 10_000 ether); // untouched
+        // ...but the ATTEMPT refreshed the dormancy clock — this is the fix.
+        assertEq(wnoxa.claimableSince(alice), block.timestamp);
+
+        // At the instant the owner COULD have seized without the fix (t0 + DELAY),
+        // rescue is still blocked: the refreshed clock has not matured.
+        vm.warp(t0 + wnoxa.ESCROW_RESCUE_DELAY());
+        vm.expectRevert(abi.encodeWithSelector(WrappedNoxaV3.EscrowNotDormant.selector, alice));
+        vm.prank(owner);
+        wnoxa.rescueEscrow(alice, bob, 1 ether);
+        assertEq(wnoxa.claimable(alice), 10_000 ether); // still the holder's
+    }
+
+    /// A no-op claim by an account with NO escrow must not stamp a dormancy clock
+    /// (that would be meaningless state, and could confuse `rescueEscrow` gating).
+    function test_claim_noopWithNoEscrow_leavesClockZero() public {
+        vm.prank(alice);
+        assertEq(wnoxa.claim(), 0);
+        assertEq(wnoxa.claimableSince(alice), 0);
+    }
+
+    // =======================================================================
+    // Foreign-token rescue (audit: uniform sweep, wNOXA escrow carved out)
+    // =======================================================================
+
+    function test_rescueForeignToken_recoversStray_blocksSelf_ownerOnly() public {
+        MockERC20 foreign = new MockERC20("Foreign", "FRN", 18);
+        foreign.mint(address(wnoxa), 1_000 ether);
+
+        // Cannot sweep wNOXA itself — the token's own balance IS the claim escrow.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(WrappedNoxaV3.InvalidRecipient.selector, address(wnoxa)));
+        wnoxa.rescueForeignToken(address(wnoxa), bob, 1);
+
+        // onlyOwner.
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        wnoxa.rescueForeignToken(address(foreign), bob, 1_000 ether);
+
+        vm.prank(owner);
+        wnoxa.rescueForeignToken(address(foreign), bob, 1_000 ether);
+        assertEq(foreign.balanceOf(bob), 1_000 ether);
     }
 }

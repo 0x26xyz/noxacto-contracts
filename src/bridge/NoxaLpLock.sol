@@ -42,6 +42,8 @@ contract NoxaLpLock is IERC721Receiver, ReentrancyGuard {
 
     event PositionLocked(uint256 indexed tokenId);
     event FeesClaimed(uint256 indexed tokenId, uint256 amount0, uint256 amount1);
+    event TokenSwept(address indexed token, address indexed to, uint256 amount);
+    event PositionRescued(uint256 indexed tokenId, address indexed to);
 
     error UnknownPosition();
     error ZeroAddress();
@@ -49,6 +51,7 @@ contract NoxaLpLock is IERC721Receiver, ReentrancyGuard {
     error NotLocked();
     error NotSeeder();
     error WrongPosition();
+    error CannotMoveLocked();
 
     /// @param positionManager_ Uniswap V3 NonfungiblePositionManager.
     /// @param feeRecipient_ Destination for collected fees (e.g. the NoxaFeeBurner).
@@ -132,5 +135,30 @@ contract NoxaLpLock is IERC721Receiver, ReentrancyGuard {
             })
         );
         emit FeesClaimed(tokenId, amount0, amount1);
+    }
+
+    /// @notice Sweep a stray ERC-20 off the lock — an airdrop, or fee tokens
+    /// mistakenly transferred here rather than collected to `feeRecipient`. The
+    /// lock holds NO ERC-20 as part of its custody (only the position NFT), so this
+    /// cannot weaken the liquidity-locked-forever invariant. Seeder only.
+    function sweepToken(address token, address to, uint256 amount) external {
+        if (msg.sender != seeder) revert NotSeeder();
+        if (to == address(0)) revert ZeroAddress();
+        IERC20(token).safeTransfer(to, amount);
+        emit TokenSwept(token, to, amount);
+    }
+
+    /// @notice Recover a STRAY position NFT — one sent here by plain `transferFrom`
+    /// AFTER the real seed is already locked, which `lockDirectTransfer` can no
+    /// longer adopt (`AlreadyLocked`) and `claimFees` never reads. Without this the
+    /// stray NFT and its fees are stuck forever. Can NEVER move `lockedTokenId`, so
+    /// the locked liquidity stays locked permanently. Seeder only.
+    function rescuePosition(uint256 tokenId, address to) external nonReentrant {
+        if (msg.sender != seeder) revert NotSeeder();
+        if (to == address(0)) revert ZeroAddress();
+        if (!locked) revert NotLocked();
+        if (tokenId == lockedTokenId) revert CannotMoveLocked();
+        positionManager.safeTransferFrom(address(this), to, tokenId);
+        emit PositionRescued(tokenId, to);
     }
 }

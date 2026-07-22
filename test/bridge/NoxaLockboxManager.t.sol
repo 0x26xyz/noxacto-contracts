@@ -484,6 +484,39 @@ contract NoxaLockboxManagerTest is Test {
         assertEq(stray.balanceOf(bob), 500 ether);
     }
 
+    // ---- audit BLOCKER: tokens sent DIRECTLY to the manager are recoverable ----
+
+    function test_rescueToken_recoversStrayOnManagerItself() public {
+        // NOXA and a foreign token sent to the published bridge (manager) address —
+        // the manager custodies nothing itself, so both are stray and recoverable.
+        vm.prank(noxaOwner);
+        noxa.transfer(address(mgr), 10_000 ether);
+        MaxWalletNoxa foreign = new MaxWalletNoxa(address(this), type(uint256).max, 1_000 ether);
+        foreign.transfer(address(mgr), 500 ether);
+        assertEq(mgr.totalCollateral(), 0); // manager's own balance is never collateral
+
+        address r = makeAddr("rescue");
+        // onlyOwner.
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        mgr.rescueToken(address(noxa), r, 1 ether);
+
+        vm.startPrank(owner);
+        mgr.rescueToken(address(noxa), r, 10_000 ether); // NOXA on the manager IS rescuable (not collateral)
+        mgr.rescueToken(address(foreign), r, 500 ether);
+        vm.stopPrank();
+        assertEq(noxa.balanceOf(r), 10_000 ether);
+        assertEq(foreign.balanceOf(r), 500 ether);
+    }
+
+    function test_rescueToken_zeroGuards() public {
+        vm.startPrank(owner);
+        vm.expectRevert(NoxaLockboxManager.ZeroAddress.selector);
+        mgr.rescueToken(address(noxa), address(0), 1 ether);
+        vm.expectRevert(NoxaLockboxManager.ZeroAmount.selector);
+        mgr.rescueToken(address(noxa), bob, 0);
+        vm.stopPrank();
+    }
+
     // ---- review (re-pass, LOW): the all-slots-poisoned case + owner recovery ----
 
     function test_poison_allSpawnSlots_ownerRecovers() public {

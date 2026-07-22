@@ -262,6 +262,21 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         emit TokenRescued(box, token, to, amount);
     }
 
+    /// @notice Recover ANY ERC-20 (NOXA included) sitting DIRECTLY on the manager
+    /// address. The manager custodies nothing itself: `lock` pulls NOXA STRAIGHT
+    /// into a shard and `totalCollateral()` sums only shard balances, so a token on
+    /// the manager is always a stray transfer to the published bridge address and
+    /// moving it can never touch collateral or the peg. This is the single most
+    /// common way users lose funds (sending to the address they approve for `lock`),
+    /// and without it those tokens are unrecoverable. Distinct from `rescueBoxToken`,
+    /// which reaches a SHARD and forbids NOXA (real collateral lives there). Owner only.
+    function rescueToken(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        IERC20(token).safeTransfer(to, amount);
+        emit TokenRescued(address(this), token, to, amount);
+    }
+
     /// @notice Move NOXA out of a specific shard by index. The recovery lever for
     /// NOXA transferred DIRECTLY to a shard outside the `lock` path — including a
     /// RETIRED shard below `oldestFundedIndex`, which `totalCollateral`/`_release`

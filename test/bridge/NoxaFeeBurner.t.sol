@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {NoxaFeeBurner} from "../../src/bridge/NoxaFeeBurner.sol";
 import {WrappedNoxa} from "../../src/bridge/WrappedNoxa.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
@@ -138,5 +139,27 @@ contract NoxaFeeBurnerTest is Test {
         vm.expectRevert(NoxaFeeBurner.RenounceDisabled.selector);
         vm.prank(cold);
         burner.renounceOwnership();
+    }
+
+    // ---- audit: recover WETH a broken/illiquid pool leaves trapped ----
+
+    function test_rescueToken_recoversTrappedWeth_ownerOnly() public {
+        weth.mint(address(burner), 5 ether); // fees that can never be swapped out
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, keeper));
+        vm.prank(keeper);
+        burner.rescueToken(address(weth), cold, 5 ether);
+
+        vm.prank(cold);
+        burner.rescueToken(address(weth), cold, 5 ether);
+        assertEq(weth.balanceOf(cold), 5 ether);
+    }
+
+    function test_rescueToken_zeroGuards() public {
+        vm.startPrank(cold);
+        vm.expectRevert(NoxaFeeBurner.ZeroAddress.selector);
+        burner.rescueToken(address(weth), address(0), 1);
+        vm.expectRevert(NoxaFeeBurner.ZeroAmount.selector);
+        burner.rescueToken(address(weth), cold, 0);
+        vm.stopPrank();
     }
 }

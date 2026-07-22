@@ -49,10 +49,13 @@ contract NoxaFeeBurner is ReentrancyGuard, Ownable2Step {
 
     event FeesBurned(uint256 wethSwapped, uint256 wnoxaBurned, uint256 returnNonce);
     event KeeperSet(address indexed keeper);
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
 
     error ZeroConfig();
     error NotKeeper();
     error NothingToBurn();
+    error ZeroAddress();
+    error ZeroAmount();
     error RenounceDisabled();
 
     /// @param owner_ Cold owner (Safe) that may rotate the keeper. Non-zero.
@@ -81,6 +84,17 @@ contract NoxaFeeBurner is ReentrancyGuard, Ownable2Step {
         if (keeper_ == address(0)) revert ZeroConfig();
         keeper = keeper_;
         emit KeeperSet(keeper_);
+    }
+
+    /// @notice Recover tokens stranded on the burner — WETH that cannot be swapped
+    /// (a broken or too-thin pool leaves `burn` reverting with the WETH trapped),
+    /// or any airdrop. The burner only ever holds fee value in transit, never peg
+    /// collateral, so an owner sweep touches no invariant. Owner (Safe) only.
+    function rescueToken(address token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        IERC20(token).safeTransfer(to, amount);
+        emit TokenRescued(token, to, amount);
     }
 
     /// @notice Disabled — renouncing would strand keeper rotation. Hand off via

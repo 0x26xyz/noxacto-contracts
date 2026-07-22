@@ -3,6 +3,8 @@ pragma solidity 0.8.28;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Capped} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Capped.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
@@ -52,6 +54,8 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 /// Everything else — revocable minter role, hard supply cap, pause circuit
 /// breaker, disabled renounce — carries over from `WrappedNoxaV2` unchanged.
 contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
+    using SafeERC20 for IERC20;
+
     /// @notice Addresses allowed to mint (the hot relayer key; the migrator during cutover).
     mapping(address account => bool) public isMinter;
 
@@ -97,6 +101,8 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
     event EscrowRescued(address indexed account, address indexed to, uint256 amount);
     /// @notice Emitted for a migration mint (escrow-backed, no bridge nonce consumed).
     event MigrationMinted(address indexed to, uint256 amount);
+    /// @notice Owner swept a FOREIGN token mistakenly sent to this contract.
+    event ForeignTokenRescued(address indexed token, address indexed to, uint256 amount);
     /// @param nonce Outbound nonce; the DBK `unlock` must consume exactly this value.
     event BurnedForReturn(uint256 indexed nonce, address indexed burner, address indexed dbkRecipient, uint256 amount);
 
@@ -239,7 +245,17 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
             ? available
             : (balance >= maxWalletAmount ? 0 : maxWalletAmount - balance);
         released = available < headroom ? available : headroom;
-        if (released == 0) return 0; // nothing to do — no-op, safe to call speculatively
+        if (released == 0) {
+            // A claim ATTEMPT by an account that still HOLDS escrow is activity —
+            // the holder is at their cap right now but is actively trying to
+            // withdraw. Refresh the dormancy clock so `rescueEscrow` (which seizes
+            // only escrow untouched for ESCROW_RESCUE_DELAY) can never take a live
+            // holder's escrow out from under them. Escrow that its beneficiary
+            // genuinely cannot claim (a contract/exchange/pool that never calls
+            // claim()) still matures and stays rescuable — the intended path.
+            if (available != 0) claimableSince[account] = block.timestamp;
+            return 0; // no-op, safe to call speculatively
+        }
 
         uint256 remaining = available - released;
         claimable[account] = remaining;
@@ -278,6 +294,19 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
         totalEscrowed -= amount;
         _transfer(address(this), to, amount); // pause + wallet cap enforced in _update
         emit EscrowRescued(account, to, amount);
+    }
+
+    /// @notice Recover a FOREIGN ERC-20 mistakenly sent to this contract (an
+    /// airdrop, or a wrong-token transfer). Cannot move wNOXA itself: the token's
+    /// own wNOXA balance IS the claim escrow, tracked by `totalEscrowed` and
+    /// releasable only through `claim`/`rescueEscrow` — sweeping it here would
+    /// break escrow accounting and the peg. Owner (Safe) only.
+    function rescueForeignToken(address token, address to, uint256 amount) external onlyOwner {
+        if (token == address(this)) revert InvalidRecipient(token);
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        IERC20(token).safeTransfer(to, amount);
+        emit ForeignTokenRescued(token, to, amount);
     }
 
     // -----------------------------------------------------------------------

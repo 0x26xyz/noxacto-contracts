@@ -242,4 +242,85 @@ contract NoxaLpLockTest is Test {
         vm.stopPrank();
         assertFalse(lock.locked());
     }
+
+    // ---- audit: stray-asset recovery that never touches the locked liquidity ----
+
+    /// Mint a correct wNOXA/WETH position owned by `to` (helper for stray-NFT tests).
+    function _mintMatchingPosition(address to, uint256 amount) internal returns (uint256 tokenId) {
+        (address t0, address t1) =
+            address(wnoxa) < address(weth) ? (address(wnoxa), address(weth)) : (address(weth), address(wnoxa));
+        if (v3Factory.getPool(t0, t1, FEE) == address(0)) {
+            address pool = v3Factory.createPool(t0, t1, FEE);
+            MockUniswapV3Pool(pool).initialize(SQRT_1);
+        }
+        wnoxa.mint(to, amount);
+        vm.startPrank(to);
+        wnoxa.approve(address(pm), amount);
+        bool tok0 = address(wnoxa) < address(weth);
+        (uint256 a0, uint256 a1) = tok0 ? (amount, uint256(0)) : (uint256(0), amount);
+        (int24 lo, int24 hi) = tok0 ? (int24(200), int24(2000)) : (int24(-2000), int24(-200));
+        (tokenId,,,) = pm.mint(
+            MockNonfungiblePositionManager.MintParams({
+                token0: t0,
+                token1: t1,
+                fee: FEE,
+                tickLower: lo,
+                tickUpper: hi,
+                amount0Desired: a0,
+                amount1Desired: a1,
+                amount0Min: 0,
+                amount1Min: 0,
+                recipient: to,
+                deadline: block.timestamp
+            })
+        );
+        vm.stopPrank();
+    }
+
+    /// A SECOND position sent in by plain `transferFrom` after the seed is locked
+    /// can't be adopted (AlreadyLocked) and `claimFees` never reads it — without
+    /// recovery it and its fees are stuck forever. `rescuePosition` frees it while
+    /// the locked liquidity (lockedTokenId) can never be moved.
+    function test_rescuePosition_freesStrayNft_neverTheLocked() public {
+        uint256 lockedId = _seedPosition(1_000 ether);
+        vm.prank(seeder);
+        pm.safeTransferFrom(seeder, address(lock), lockedId);
+        assertTrue(lock.locked());
+
+        // A stray second position lands via plain transferFrom (no receive hook).
+        uint256 strayId = _mintMatchingPosition(seeder, 10 ether);
+        vm.prank(seeder);
+        pm.transferFrom(seeder, address(lock), strayId);
+        assertEq(pm.ownerOf(strayId), address(lock));
+
+        // The locked position can NEVER be rescued out.
+        vm.prank(seeder);
+        vm.expectRevert(NoxaLpLock.CannotMoveLocked.selector);
+        lock.rescuePosition(lockedId, seeder);
+
+        // Non-seeder cannot rescue.
+        vm.expectRevert(NoxaLpLock.NotSeeder.selector);
+        lock.rescuePosition(strayId, seeder);
+
+        // Seeder recovers the stray NFT; the locked one stays put.
+        address to = makeAddr("nftrecover");
+        vm.prank(seeder);
+        lock.rescuePosition(strayId, to);
+        assertEq(pm.ownerOf(strayId), to);
+        assertEq(pm.ownerOf(lockedId), address(lock)); // liquidity still locked
+        assertEq(lock.lockedTokenId(), lockedId);
+    }
+
+    function test_sweepToken_recoversStrayErc20_seederOnly() public {
+        MockERC20 stray = new MockERC20("Stray", "STR", 18);
+        stray.mint(address(lock), 500 ether);
+
+        vm.expectRevert(NoxaLpLock.NotSeeder.selector);
+        lock.sweepToken(address(stray), seeder, 500 ether);
+
+        address to = makeAddr("erc20recover");
+        vm.prank(seeder);
+        lock.sweepToken(address(stray), to, 500 ether);
+        assertEq(stray.balanceOf(to), 500 ether);
+    }
 }
