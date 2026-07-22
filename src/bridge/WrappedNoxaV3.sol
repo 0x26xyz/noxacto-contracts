@@ -243,7 +243,12 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
 
         uint256 remaining = available - released;
         claimable[account] = remaining;
-        if (remaining == 0) claimableSince[account] = 0; // escrow fully drained — stop the clock
+        // A successful (often partial) claim IS activity: reset the dormancy clock
+        // so rescueEscrow measures time-since-last-activity, not time-since-first-
+        // credit. Draining a >cap escrow is a multi-tranche flow over days, and the
+        // owner must not be able to rescue the remainder right after a fresh claim
+        // (round-4). Full drain zeroes the clock; a partial claim restarts it.
+        claimableSince[account] = remaining == 0 ? 0 : block.timestamp;
         totalEscrowed -= released;
         _transfer(address(this), account, released); // pause + wallet cap enforced in _update
         emit EscrowClaimed(account, released);

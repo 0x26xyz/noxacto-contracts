@@ -309,6 +309,34 @@ contract WrappedNoxaV3Test is Test {
         assertEq(wnoxa.claimableSince(alice), 0); // clock reset on full drain
     }
 
+    /// round-4: a partial claim is activity and resets the dormancy clock, so the
+    /// owner cannot rescue the remainder right after the recipient just claimed.
+    function test_rescueEscrow_partialClaimResetsDormancy() public {
+        _mint(alice, 20_000 ether, 1); // balance 20K -> headroom is only 5K
+        _mint(alice, 30_000 ether, 2); // 30K escrowed (> headroom), clock starts here
+        vm.warp(block.timestamp + wnoxa.ESCROW_RESCUE_DELAY() - 1);
+
+        // Alice claims a tranche: released clamps to the 5K headroom, 25K remains.
+        vm.prank(alice);
+        uint256 released = wnoxa.claim();
+        assertEq(released, 5_000 ether);
+        assertEq(wnoxa.claimable(alice), 25_000 ether); // still escrowed
+        assertEq(wnoxa.claimableSince(alice), block.timestamp); // clock RESET by the claim
+
+        // Owner cannot rescue right after the claim, even though >7 days passed
+        // since the original credit — the claim restarted dormancy.
+        vm.expectRevert(abi.encodeWithSelector(WrappedNoxaV3.EscrowNotDormant.selector, alice));
+        vm.prank(owner);
+        wnoxa.rescueEscrow(alice, bob, 1 ether);
+
+        // Only after a fresh full dormancy window with no activity does rescue open.
+        vm.warp(block.timestamp + wnoxa.ESCROW_RESCUE_DELAY());
+        uint256 rem = wnoxa.claimable(alice);
+        vm.prank(owner);
+        wnoxa.rescueEscrow(alice, bob, rem);
+        assertGt(wnoxa.balanceOf(bob), 0);
+    }
+
     function test_rescueEscrow_zeroGuards() public {
         _mint(address(wnoxa), 1 ether, 0);
         vm.startPrank(owner);
