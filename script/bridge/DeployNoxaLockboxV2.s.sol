@@ -4,16 +4,13 @@ pragma solidity 0.8.28;
 import {Script, console2} from "forge-std/Script.sol";
 import {NoxaLockboxV2} from "../../src/bridge/NoxaLockboxV2.sol";
 
-/// @dev Deploys the hardened NoxaLockboxV2 on **DBK Chain**.
-///
-///   forge script script/bridge/DeployNoxaLockboxV2.s.sol:DeployNoxaLockboxV2 \
-///     --rpc-url $DBK_RPC_URL --broadcast --verify \
-///     --with-gas-price 3000000 --priority-gas-price 2000000
-///
-/// BRIDGE_AUTHORITY = cold owner (Safe/EOA). UNLOCKER = hot relayer key for routine
-/// returns, bounded by UNLOCK_CAP per tx and UNLOCK_COOLDOWN seconds between txs.
-/// Large/emergency returns go through the owner's uncapped `ownerUnlock`. Pick a
-/// cap that covers ordinary returns but caps a leaked-key drain to one cap/cooldown.
+/// @dev DEPRECATED — do NOT deploy. Kept only to build/verify the already-live v2
+/// lockbox. NoxaLockboxV2's hot-path limit is a per-tx cap plus an optional
+/// cooldown, and the shipped `UNLOCK_COOLDOWN=0` default nullifies the rate limit
+/// entirely (a leaked key drains via many caller-chosen nonces). It also has no
+/// way to reopen a mis-settled `processedBurn` nonce. Deploy `NoxaLockboxV3`
+/// (leaky-bucket value+count budgets, clearable replay guard, one box per wNOXA
+/// version) via `DeployNoxaLockboxV3.s.sol` instead. See the 2026-07 review.
 contract DeployNoxaLockboxV2 is Script {
     function run() external {
         address noxa = vm.envAddress("NOXA_ADDRESS");

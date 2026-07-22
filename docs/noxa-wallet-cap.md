@@ -182,6 +182,17 @@ The cap also simplifies the mechanics: no wallet can hold >25K, so **no single
 
 ### 4.4 Testing bar
 
+- **Review status (3 passes, adversarially verified):** round-1 HIGH-1/2/3 →
+  `NoxaLockboxV3` (per-version box). Round-2 (lockbox) NEW-1 tumbling window,
+  NEW-2 nonce-count griefing, NEW-3 batched recovery → dual leaky buckets +
+  batch/range `clearProcessedBurn*` + bucket-reset-on-rotation + cap-lower
+  clamp. Round-1 wNOXA mediums → MED-1 `rescueEscrow` (dormancy-gated,
+  clock resets per credit), MED-3 documented (escrow uncapped-but-parked,
+  withdrawal cap-limited), MED-4 `claim()` is a no-op (returns 0) at the cap.
+  MED-2 → `NoxaFeeBurner` keeper mandatory AND rotatable (`setKeeper`, cold
+  owner). `NoxaLpLock.lockDirectTransfer` recovers a non-safe-transferred
+  position. Each pass verified by a multi-agent adversarial workflow; the sole
+  surviving round-3 finding (immutable keeper) is fixed.
 - v3 unit+fuzz+invariant suite: `test/bridge/WrappedNoxaV3.t.sol` (cap
   boundaries, escrow/claim flows incl. dust-front-running immunity and
   parked-escrow rescue, migration cap-revert, source-parity self-transfer,

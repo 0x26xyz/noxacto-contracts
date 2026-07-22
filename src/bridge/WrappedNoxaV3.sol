@@ -35,6 +35,20 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 /// `mintMigration` deliberately does NOT escrow: migration is interactive (the
 /// caller is the recipient), so a cap revert is retryable with a smaller amount.
 ///
+/// Escrow properties, stated explicitly (review MED-1/MED-3):
+/// - `claimable[account]` is UNCAPPED and cap-exempt while parked in the token —
+///   this is deliberate: inbound bridge mints must never wedge, so any number of
+///   ≤25K DBK locks naming the same RH recipient accumulate as claimable there.
+///   It is NOT a cap bypass: WITHDRAWAL throughput is still cap-limited (`claim`
+///   releases only up to headroom), so no wallet ever HOLDS >25K.
+/// - A recipient that cannot call `claim()` (a contract wallet, an exchange
+///   deposit address, or the wNOXA/WETH pool before it is cap-excluded) would
+///   otherwise strand its escrow forever. `rescueEscrow` lets the cold owner move
+///   such escrow to a recovery address — immediately for token-self-parked
+///   escrow, and for a real address only after `ESCROW_RESCUE_DELAY` with no new
+///   inbound credit (the clock resets on every credit), so escrow that is still
+///   actively arriving is never rescuable out from under its recipient.
+///
 /// Everything else — revocable minter role, hard supply cap, pause circuit
 /// breaker, disabled renounce — carries over from `WrappedNoxaV2` unchanged.
 contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
@@ -57,8 +71,17 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
     /// @notice Escrowed bridge mints awaiting a recipient with cap headroom.
     mapping(address account => uint256) public claimable;
 
+    /// @notice When an account's escrow was first credited (0 when it has none).
+    /// Gates the owner's dormancy-delayed `rescueEscrow` so a real recipient's own
+    /// claim can never be front-run. Reset to 0 whenever `claimable` returns to 0.
+    mapping(address account => uint256) public claimableSince;
+
     /// @notice Sum of all `claimable` balances (monitoring: `balanceOf(this) >= totalEscrowed`).
     uint256 public totalEscrowed;
+
+    /// @notice Dormancy an account's escrow must sit before the owner may rescue it
+    /// to a recovery address (token-self-parked escrow is exempt — it has no claimer).
+    uint256 public constant ESCROW_RESCUE_DELAY = 7 days;
 
     event MinterSet(address indexed account, bool allowed);
     event MaxWalletSet(uint256 amount);
@@ -70,8 +93,8 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
     event MintEscrowed(uint256 indexed srcLockNonce, address indexed to, uint256 amount);
     /// @notice Escrowed tokens released to their beneficiary.
     event EscrowClaimed(address indexed account, uint256 amount);
-    /// @notice Owner recovered escrow that was parked on the token itself.
-    event ParkedEscrowRescued(address indexed to, uint256 amount);
+    /// @notice Owner recovered stuck escrow (self-parked, or a dormant real account).
+    event EscrowRescued(address indexed account, address indexed to, uint256 amount);
     /// @notice Emitted for a migration mint (escrow-backed, no bridge nonce consumed).
     event MigrationMinted(address indexed to, uint256 amount);
     /// @param nonce Outbound nonce; the DBK `unlock` must consume exactly this value.
@@ -84,6 +107,7 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
     error MaxWalletReached(address account, uint256 balance, uint256 maxWallet);
     error InvalidRecipient(address recipient);
     error InsufficientClaimable(uint256 requested, uint256 available);
+    error EscrowNotDormant(address account);
     error RenounceDisabled();
 
     /// @param bridgeAuthority_ Cold owner (Safe) — manages minters, cap exclusions, pause.
@@ -156,7 +180,7 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
     /// - recipient is this contract (a DBK lock naming the token as its RH
     ///   recipient — the wrapped-side equivalent of sending tokens to a token
     ///   contract) -> parked as `claimable[address(this)]`, unclaimable by third
-    ///   parties, recoverable by the owner via `rescueParkedEscrow`. (v2 silently
+    ///   parties, recoverable by the owner via `rescueEscrow`. (v2 silently
     ///   voided such funds; reverting instead would strand the lock nonce.)
     function mint(address to, uint256 amount, uint256 srcLockNonce) external onlyMinter whenNotPaused {
         if (to == address(0)) revert ZeroAddress();
@@ -165,6 +189,11 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
         processedLock[srcLockNonce] = true;
 
         if (to == address(this) || (!isCapExcluded[to] && balanceOf(to) + amount > maxWalletAmount)) {
+            // Reset the dormancy clock on EVERY credit, so ESCROW_RESCUE_DELAY
+            // measures time-since-LAST-credit: a still-active bridge target keeps
+            // its escrow un-rescuable, and freshly-credited escrow can never ride
+            // an older account's already-matured clock (round-3 finding).
+            claimableSince[to] = block.timestamp;
             claimable[to] += amount;
             totalEscrowed += amount;
             _mint(address(this), amount); // supply-cap-bounded via ERC20Capped
@@ -196,41 +225,54 @@ contract WrappedNoxaV3 is ERC20Capped, Ownable2Step, Pausable {
     /// headroom allows: `min(claimable, maxWalletAmount - balance)`. The amount
     /// is computed at execution time — no parameter — so a claim cannot be
     /// front-run into a revert by dust-transferring the caller to their cap.
-    /// Reverts if nothing is claimable or the caller is at the cap (free
-    /// headroom first: transfer out, or `burnForReturn` back to DBK).
+    /// Returns 0 (a safe no-op, NOT a revert) when nothing is claimable or the
+    /// caller is at the cap, so a UI may call it speculatively (review MED-4);
+    /// free headroom first (transfer out, or `burnForReturn`) then call again.
     /// Caller-only by design: a third-party push could fill the beneficiary's
     /// headroom at moments an attacker chooses (transfer/swap griefing).
     function claim() external returns (uint256 released) {
         address account = msg.sender;
         uint256 available = claimable[account];
-        if (available == 0) revert ZeroAmount();
 
         uint256 balance = balanceOf(account);
         uint256 headroom = isCapExcluded[account]
             ? available
             : (balance >= maxWalletAmount ? 0 : maxWalletAmount - balance);
         released = available < headroom ? available : headroom;
-        if (released == 0) revert ZeroAmount(); // at the cap — make headroom first
+        if (released == 0) return 0; // nothing to do — no-op, safe to call speculatively
 
-        claimable[account] = available - released;
+        uint256 remaining = available - released;
+        claimable[account] = remaining;
+        if (remaining == 0) claimableSince[account] = 0; // escrow fully drained — stop the clock
         totalEscrowed -= released;
         _transfer(address(this), account, released); // pause + wallet cap enforced in _update
         emit EscrowClaimed(account, released);
     }
 
-    /// @notice Recover escrow parked on the token itself — the result of a DBK
-    /// lock naming this contract as its RH recipient. Owner (Safe) only; bounded
-    /// to exactly the self-parked credit, so user escrow is untouchable. The
+    /// @notice Owner recovery for escrow that its beneficiary cannot claim — a
+    /// contract wallet / exchange address / the pool before exclusion (review
+    /// MED-1), or escrow parked on the token itself (a DBK lock naming this
+    /// contract as recipient). Bounded to the account's own `claimable`, so no
+    /// other user's escrow is touchable. Token-self-parked escrow has no
+    /// legitimate claimer and is recoverable immediately; escrow credited to a
+    /// REAL address is recoverable only after `ESCROW_RESCUE_DELAY` of dormancy,
+    /// so the owner can never front-run the recipient's own pending `claim`. The
     /// wallet cap still applies to `to` unless excluded.
-    function rescueParkedEscrow(address to, uint256 amount) external onlyOwner {
+    function rescueEscrow(address account, address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
-        uint256 parked = claimable[address(this)];
-        if (amount > parked) revert InsufficientClaimable(amount, parked);
-        claimable[address(this)] = parked - amount;
+        if (account != address(this)) {
+            uint256 since = claimableSince[account];
+            if (since == 0 || block.timestamp < since + ESCROW_RESCUE_DELAY) revert EscrowNotDormant(account);
+        }
+        uint256 avail = claimable[account];
+        if (amount > avail) revert InsufficientClaimable(amount, avail);
+        uint256 remaining = avail - amount;
+        claimable[account] = remaining;
+        if (remaining == 0) claimableSince[account] = 0;
         totalEscrowed -= amount;
         _transfer(address(this), to, amount); // pause + wallet cap enforced in _update
-        emit ParkedEscrowRescued(to, amount);
+        emit EscrowRescued(account, to, amount);
     }
 
     // -----------------------------------------------------------------------

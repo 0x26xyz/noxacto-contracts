@@ -98,6 +98,23 @@ contract NoxaLpLock is IERC721Receiver, ReentrancyGuard {
         return IERC721Receiver.onERC721Received.selector;
     }
 
+    /// @notice Lock a position that was transferred in via plain `transferFrom`
+    /// (which does NOT trigger `onERC721Received`, so it would otherwise sit here
+    /// unlocked forever — `claimFees` reverts `NotLocked` and the NFT is stuck).
+    /// Seeder-only, same pair/fee validation as the receive hook. Recovers the
+    /// one-seed-mistake footgun without opening any new escape path for the NFT.
+    function lockDirectTransfer(uint256 tokenId) external {
+        if (msg.sender != seeder) revert NotSeeder();
+        if (locked) revert AlreadyLocked();
+        if (positionManager.ownerOf(tokenId) != address(this)) revert UnknownPosition();
+        (,, address token0, address token1, uint24 fee,,,,,,,) = positionManager.positions(tokenId);
+        if (token0 != expectedToken0 || token1 != expectedToken1 || fee != expectedFee) revert WrongPosition();
+
+        locked = true;
+        lockedTokenId = tokenId;
+        emit PositionLocked(tokenId);
+    }
+
     /// @notice Collect accrued V3 trading fees for the locked position and send
     /// them to `feeRecipient`. Permissionless. Principal is never touched.
     /// @dev nonReentrant + checks-effects-interactions: the only external call is

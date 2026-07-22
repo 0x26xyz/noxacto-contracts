@@ -72,7 +72,7 @@ contract WNoxaV3Handler is Test {
         if (max == 0) return;
         amount = bound(amount, 1, max);
         vm.prank(owner);
-        wnoxa.rescueParkedEscrow(actor, amount);
+        wnoxa.rescueEscrow(address(wnoxa), actor, amount);
     }
 
     /// @dev Peer transfer bounded by sender balance and recipient headroom.

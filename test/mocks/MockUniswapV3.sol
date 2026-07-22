@@ -205,6 +205,15 @@ contract MockNonfungiblePositionManager {
         return (0, address(0), pos.token0, pos.token1, pos.fee, pos.tickLower, pos.tickUpper, pos.liquidity, 0, 0, pos.tokensOwed0, pos.tokensOwed1);
     }
 
+    /// @dev Plain (non-safe) transfer: moves ownership WITHOUT the onERC721Received
+    /// callback — the footgun `NoxaLpLock.lockDirectTransfer` recovers from.
+    function transferFrom(address from, address to, uint256 tokenId) external {
+        address owner = ownerOf[tokenId];
+        if (owner != from) revert NotOwner();
+        if (msg.sender != owner) revert NotAuthorized();
+        ownerOf[tokenId] = to;
+    }
+
     function safeTransferFrom(address from, address to, uint256 tokenId) external {
         safeTransferFrom(from, to, tokenId, "");
     }

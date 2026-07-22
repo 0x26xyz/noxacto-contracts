@@ -124,6 +124,36 @@ contract NoxaLpLockTest is Test {
         lock.onERC721Received(address(this), address(this), 1, "");
     }
 
+    /// A position moved in via PLAIN transferFrom never triggers onERC721Received,
+    /// so it lands unlocked; the seeder recovers it with lockDirectTransfer.
+    function test_lockDirectTransfer_recoversNonSafeTransfer() public {
+        uint256 tokenId = _seedPosition(1_000 ether);
+        vm.prank(seeder);
+        pm.transferFrom(seeder, address(lock), tokenId); // no receive hook
+        assertFalse(lock.locked());
+
+        // Non-seeder cannot lock it.
+        vm.expectRevert(NoxaLpLock.NotSeeder.selector);
+        lock.lockDirectTransfer(tokenId);
+
+        vm.prank(seeder);
+        lock.lockDirectTransfer(tokenId);
+        assertTrue(lock.locked());
+        assertEq(lock.lockedTokenId(), tokenId);
+
+        // claimFees now works and double-lock is rejected.
+        vm.expectRevert(NoxaLpLock.AlreadyLocked.selector);
+        vm.prank(seeder);
+        lock.lockDirectTransfer(tokenId);
+    }
+
+    function test_lockDirectTransfer_rejectsUnownedAndWrongPair() public {
+        uint256 tokenId = _seedPosition(1_000 ether); // still owned by seeder, not the lock
+        vm.expectRevert(NoxaLpLock.UnknownPosition.selector);
+        vm.prank(seeder);
+        lock.lockDirectTransfer(tokenId);
+    }
+
     function test_claimFees_reverts_whenNotLocked() public {
         vm.expectRevert(NoxaLpLock.NotLocked.selector);
         lock.claimFees();

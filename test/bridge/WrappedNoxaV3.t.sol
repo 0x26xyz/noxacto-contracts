@@ -263,30 +263,60 @@ contract WrappedNoxaV3Test is Test {
         assertEq(wnoxa.balanceOf(address(wnoxa)), 1 ether);
     }
 
-    function test_rescueParkedEscrow_ownerOnly_boundedToParked() public {
-        _mint(address(wnoxa), 5 ether, 0); // parked
+    function test_rescueEscrow_selfParked_immediate_boundedToParked() public {
+        _mint(address(wnoxa), 5 ether, 0); // parked (token-as-recipient)
         _mint(alice, 20_000 ether, 1);
         _mint(alice, 10_000 ether, 2); // alice's own escrow: 10K
 
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
         vm.prank(alice);
-        wnoxa.rescueParkedEscrow(alice, 1 ether);
+        wnoxa.rescueEscrow(address(wnoxa), alice, 1 ether);
 
         // Bounded to the SELF-parked credit — user escrow is untouchable.
         vm.expectRevert(abi.encodeWithSelector(WrappedNoxaV3.InsufficientClaimable.selector, 6 ether, 5 ether));
         vm.prank(owner);
-        wnoxa.rescueParkedEscrow(bob, 6 ether);
+        wnoxa.rescueEscrow(address(wnoxa), bob, 6 ether);
 
-        vm.expectEmit(true, false, false, true);
-        emit WrappedNoxaV3.ParkedEscrowRescued(bob, 5 ether);
+        // Self-parked escrow is recoverable immediately (no dormancy).
+        vm.expectEmit(true, true, false, true);
+        emit WrappedNoxaV3.EscrowRescued(address(wnoxa), bob, 5 ether);
         vm.prank(owner);
-        wnoxa.rescueParkedEscrow(bob, 5 ether);
+        wnoxa.rescueEscrow(address(wnoxa), bob, 5 ether);
 
         assertEq(wnoxa.balanceOf(bob), 5 ether);
         assertEq(wnoxa.claimable(address(wnoxa)), 0);
         assertEq(wnoxa.claimable(alice), 10_000 ether); // untouched
         assertEq(wnoxa.totalEscrowed(), 10_000 ether);
         assertEq(wnoxa.balanceOf(address(wnoxa)), 10_000 ether);
+    }
+
+    function test_rescueEscrow_realAccount_requiresDormancy() public {
+        // A contract/exchange address that can't call claim(); escrow over cap.
+        _mint(alice, 20_000 ether, 1);
+        _mint(alice, 10_000 ether, 2); // 10K escrowed to alice
+        assertEq(wnoxa.claimableSince(alice), block.timestamp);
+
+        // Before dormancy elapses the owner cannot touch a real account's escrow.
+        vm.expectRevert(abi.encodeWithSelector(WrappedNoxaV3.EscrowNotDormant.selector, alice));
+        vm.prank(owner);
+        wnoxa.rescueEscrow(alice, bob, 1 ether);
+
+        vm.warp(block.timestamp + wnoxa.ESCROW_RESCUE_DELAY());
+        vm.prank(owner);
+        wnoxa.rescueEscrow(alice, bob, 10_000 ether); // dormant — recoverable to a recovery address
+        assertEq(wnoxa.balanceOf(bob), 10_000 ether);
+        assertEq(wnoxa.claimable(alice), 0);
+        assertEq(wnoxa.claimableSince(alice), 0); // clock reset on full drain
+    }
+
+    function test_rescueEscrow_zeroGuards() public {
+        _mint(address(wnoxa), 1 ether, 0);
+        vm.startPrank(owner);
+        vm.expectRevert(WrappedNoxaV3.ZeroAddress.selector);
+        wnoxa.rescueEscrow(address(wnoxa), address(0), 1 ether);
+        vm.expectRevert(WrappedNoxaV3.ZeroAmount.selector);
+        wnoxa.rescueEscrow(address(wnoxa), bob, 0);
+        vm.stopPrank();
     }
 
     function test_mintMigration_toTokenContract_reverts() public {
@@ -315,13 +345,13 @@ contract WrappedNoxaV3Test is Test {
         assertEq(wnoxa.claimable(alice), escrowed);
     }
 
-    function test_claim_atCap_revertsUntilHeadroomMade() public {
+    function test_claim_atCap_noOpUntilHeadroomMade() public {
         _escrowForAlice(MAX_WALLET, 10_000 ether);
 
-        // No headroom yet — claim() has nothing it can release.
-        vm.expectRevert(WrappedNoxaV3.ZeroAmount.selector);
+        // No headroom yet — claim() is a safe no-op (returns 0, does NOT revert; MED-4).
         vm.prank(alice);
-        wnoxa.claim();
+        assertEq(wnoxa.claim(), 0);
+        assertEq(wnoxa.claimable(alice), 10_000 ether); // untouched
 
         // Exit 10K to DBK — burns are cap-exempt — then the claim fits exactly.
         vm.prank(alice);
@@ -351,7 +381,7 @@ contract WrappedNoxaV3Test is Test {
     function test_claim_immuneToDustFrontRunning() public {
         _escrowForAlice(21_000 ether, 5_000 ether); // 21K + 5K > 25K -> escrowed
         // Attacker dust-gifts alice right before her claim; an exact-amount
-        // claim would now revert — auto-sizing just clamps and succeeds.
+        // claim would fail — auto-sizing just clamps and succeeds.
         _mint(bob, 10 ether, 200);
         vm.prank(bob);
         wnoxa.transfer(alice, 1);
@@ -362,10 +392,9 @@ contract WrappedNoxaV3Test is Test {
         assertEq(wnoxa.claimable(alice), 1_000 ether + 1);
     }
 
-    function test_claim_nothingClaimable_reverts() public {
-        vm.expectRevert(WrappedNoxaV3.ZeroAmount.selector);
+    function test_claim_nothingClaimable_isNoOp() public {
         vm.prank(alice);
-        wnoxa.claim();
+        assertEq(wnoxa.claim(), 0); // no escrow -> no-op, not a revert (MED-4)
     }
 
     function test_claim_afterCapRaise() public {
@@ -515,13 +544,6 @@ contract WrappedNoxaV3Test is Test {
         wnoxa.burnForReturn(0, alice);
         vm.expectRevert(WrappedNoxaV3.ZeroAddress.selector);
         wnoxa.burnForReturn(1 ether, address(0));
-        vm.stopPrank();
-
-        vm.startPrank(owner);
-        vm.expectRevert(WrappedNoxaV3.ZeroAddress.selector);
-        wnoxa.rescueParkedEscrow(address(0), 1 ether);
-        vm.expectRevert(WrappedNoxaV3.ZeroAmount.selector);
-        wnoxa.rescueParkedEscrow(bob, 0);
         vm.stopPrank();
     }
 

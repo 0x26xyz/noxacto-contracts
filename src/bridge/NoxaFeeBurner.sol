@@ -4,6 +4,8 @@ pragma solidity 0.8.28;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ISwapRouter} from "../interfaces/IUniswapV3.sol";
 
 /// @dev The wNOXA burn-back path used to return 100% of fees to real NOXA.
@@ -25,7 +27,7 @@ interface IWrappedNoxaBurn {
 ///
 /// Note: NOXA is fee-on-transfer, so the dead-address transfer on DBK may route a
 /// small cut to NOXA's fee sink; the remainder is burned. wNOXA/WETH are clean.
-contract NoxaFeeBurner is ReentrancyGuard {
+contract NoxaFeeBurner is ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
     /// @notice Standard burn sink on DBK — real NOXA sent here leaves circulation.
@@ -36,33 +38,65 @@ contract NoxaFeeBurner is ReentrancyGuard {
     ISwapRouter public immutable swapRouter;
     /// @notice wNOXA/WETH pool fee tier (1% = 10000, matching the launchpad).
     uint24 public immutable feeTier;
-    /// @notice Optional keeper that alone may call `burn` (anti-MEV). 0 = permissionless.
-    address public immutable keeper;
+    /// @notice The keeper that alone may call `burn`. MANDATORY (review MED-2):
+    /// `claimFees()` on the lock is permissionless, so a permissionless `burn`
+    /// would let anyone sandwich the WETH->wNOXA swap in a thin 1% pool and
+    /// extract 100% of accrued fee value. The keeper supplies `minWNoxaOut`.
+    /// ROTATABLE by the cold owner (`setKeeper`) — a leaked keeper is revocable,
+    /// mirroring `WrappedNoxaV3.setMinter`, so the flywheel isn't permanently
+    /// griefable and the whole stack need not be redeployed (round-3 finding).
+    address public keeper;
 
     event FeesBurned(uint256 wethSwapped, uint256 wnoxaBurned, uint256 returnNonce);
+    event KeeperSet(address indexed keeper);
 
     error ZeroConfig();
     error NotKeeper();
     error NothingToBurn();
+    error RenounceDisabled();
 
-    constructor(address wnoxa_, address weth_, address swapRouter_, uint24 feeTier_, address keeper_) {
-        if (wnoxa_ == address(0) || weth_ == address(0) || swapRouter_ == address(0) || feeTier_ == 0) {
+    /// @param owner_ Cold owner (Safe) that may rotate the keeper. Non-zero.
+    /// @param keeper_ Initial keeper (the private-relay/keeper EOA). Non-zero.
+    constructor(address wnoxa_, address weth_, address swapRouter_, uint24 feeTier_, address keeper_, address owner_)
+        Ownable(owner_)
+    {
+        if (
+            wnoxa_ == address(0) || weth_ == address(0) || swapRouter_ == address(0) || feeTier_ == 0
+                || keeper_ == address(0) // keeper is mandatory — see MED-2
+        ) {
             revert ZeroConfig();
         }
         wnoxa = IERC20(wnoxa_);
         weth = IERC20(weth_);
         swapRouter = ISwapRouter(swapRouter_);
         feeTier = feeTier_;
-        keeper = keeper_; // may be zero (permissionless)
+        keeper = keeper_;
+        emit KeeperSet(keeper_);
+    }
+
+    /// @notice Rotate the keeper. Cold owner (Safe) only. Primary response to a
+    /// leaked keeper key — no need to redeploy the burner (whose `feeRecipient`
+    /// binding on the locked LP position is immutable).
+    function setKeeper(address keeper_) external onlyOwner {
+        if (keeper_ == address(0)) revert ZeroConfig();
+        keeper = keeper_;
+        emit KeeperSet(keeper_);
+    }
+
+    /// @notice Disabled — renouncing would strand keeper rotation. Hand off via
+    /// 2-step `transferOwnership`.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     /// @notice Convert accrued WETH fees into wNOXA and burn ALL held wNOXA back to
     /// real NOXA on DBK. Call `NoxaLpLock.claimFees()` first to push fees here.
-    /// @param minWNoxaOut Minimum wNOXA out of the WETH swap (slippage/MEV guard).
-    ///        Pass 0 only if there is no WETH to swap or you accept any price.
+    /// @param minWNoxaOut Minimum wNOXA out of the WETH swap (slippage/MEV guard);
+    ///        the keeper derives it off-chain from a quote/TWAP. Pass 0 only if
+    ///        there is no WETH to swap.
     /// @return returnNonce The wNOXA `BurnedForReturn` nonce the relayer will settle.
     function burn(uint256 minWNoxaOut) external nonReentrant returns (uint256 returnNonce) {
-        if (keeper != address(0) && msg.sender != keeper) revert NotKeeper();
+        if (msg.sender != keeper) revert NotKeeper(); // keeper mandatory (MED-2)
 
         // 1. Swap the WETH side into wNOXA (a real buy in the pool).
         uint256 wethBal = weth.balanceOf(address(this));
