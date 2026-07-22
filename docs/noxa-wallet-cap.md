@@ -88,7 +88,21 @@ those tokenomics instead of becoming a whale's bypass vehicle.
 The cap also simplifies the mechanics: no wallet can hold >25K, so **no single
 `lock()` can exceed 25K** — deposits arrive in ≤25K chunks by construction.
 
-### 4.1 `NoxaLockboxFactory` (DBK) — DEFERRED
+**BUILT 2026-07-22 (`src/bridge/NoxaLockboxManager.sol` + `NoxaShardedBox.sol`).**
+Single manager, one global lock nonce + global `processedBurn`, lazy shard
+spawning (each ≤ cap), oldest-first cross-shard drain with a bounded cursor,
+V3's dual leaky-bucket hot/cold split, `totalCollateral()` for the drift breaker.
+Hardened through two adversarial passes: `lock` pulls NOXA STRAIGHT into a shard
+(the manager never custodies, so stray NOXA can't cap-brick inbound, and
+`received` is a single-hop delta so RH never over-mints); poisoned spawn
+addresses are absorbed as collateral (`spawnBoxes` owner escape hatch);
+`ownerDrainShard` recovers NOXA stray-sent to a retired shard; `rescueBoxToken`
+for non-NOXA. Relayer needs `LOCKBOX_IS_MANAGER=true` (reads `totalCollateral()`);
+UI likewise. NOT yet deployed. Known residual: the outbound recipient-cap wedge
+(a DBK recipient already near their own 25K cap) is still relayer policy — the
+relayer must skip-and-continue so one wedged burn doesn't head-of-line block.
+
+### 4.1 `NoxaLockboxFactory` (DBK) — SUPERSEDED by NoxaLockboxManager (built)
 
 - Deploys `NoxaLockboxV2`-style boxes at deterministic CREATE2 addresses;
   maintains an on-chain registry (`boxes(i)`, `boxCount()`).
