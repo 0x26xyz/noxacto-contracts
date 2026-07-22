@@ -110,7 +110,10 @@ contract SeedWrappedNoxaLiquidity is Script {
                 amount0Min: 0,
                 amount1Min: 0,
                 recipient: recipient,
-                deadline: block.timestamp
+                // Buffer the deadline: forge mines the broadcast a few seconds
+                // after the run() sim, so a bare block.timestamp deadline is
+                // already stale ("Transaction too old") by mining time.
+                deadline: block.timestamp + 3600
             })
         );
 
