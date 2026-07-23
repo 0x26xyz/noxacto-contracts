@@ -656,15 +656,64 @@ contract NoxaLockboxManagerTest is Test {
 
     /// Fuzz: for any fee ≤ ceiling and any deposit, vaulted collateral equals the
     /// emitted (mintable) amount and fee + net add back up to what the shard got.
+    /// Uses the 3-arg lock with the EXACT expected net as the floor: any
+    /// off-by-one in the fee math would trip InsufficientReceived and fail.
     function testFuzz_burnFee_conservation(uint256 bps, uint256 amount) public {
         bps = bps % 201; // 0..MAX_BRIDGE_FEE_BPS
         amount = 1 + (amount % CAP);
         NoxaLockboxManager m = _feeMgr(bps);
-        (, uint256 received) = m.lock(amount, bob);
         uint256 fee = (amount * bps) / 10_000;
+        (, uint256 received) = m.lock(amount, bob, amount - fee);
         assertEq(received, amount - fee);
         assertEq(m.totalCollateral(), received);
         assertEq(noxa.balanceOf(DEAD), fee);
+    }
+
+    // ---- minReceived: the caller's floor on the net (mintable) amount ----
+
+    function test_lock_minReceived_exactQuotePasses() public {
+        NoxaLockboxManager m = _feeMgr(100);
+        (, uint256 received) = m.lock(10_000 ether, bob, 9_900 ether);
+        assertEq(received, 9_900 ether);
+    }
+
+    function test_lock_minReceived_feeRaiseRacingTxReverts() public {
+        NoxaLockboxManager m = _feeMgr(100);
+        // User quotes at 1% (net 9_900); the owner's fee raise lands first.
+        vm.prank(owner);
+        m.setBridgeFeeBps(200);
+        vm.expectRevert(
+            abi.encodeWithSelector(NoxaLockboxManager.InsufficientReceived.selector, 9_800 ether, 9_900 ether)
+        );
+        m.lock(10_000 ether, bob, 9_900 ether);
+        // The reverted attempt consumed nothing: no nonce, no collateral.
+        assertEq(m.lockNonce(), 0);
+        assertEq(m.totalCollateral(), 0);
+    }
+
+    /// The failure mode if DEAD were NOT cap-excluded (on the real NOXA it is,
+    /// hardcoded in the verified source, cap-doc §3(d)): the skim reverts and
+    /// takes EVERY inbound lock down with it. Prove the documented escape hatch,
+    /// `setBridgeFeeBps(0)`, actually restores `lock` with no redeploy.
+    function test_burnFee_deadCapRevert_zeroFeeRecovers() public {
+        NoxaLockboxManager m =
+            new NoxaLockboxManager(address(noxa), wnoxa, owner, unlocker, CAP, VCAP, CCAP, WINDOW, 100);
+        noxa.approve(address(m), type(uint256).max);
+        // DEAD deliberately NOT excluded here; park it exactly at its own cap.
+        noxa.transfer(DEAD, CAP);
+
+        // The 100-ether skim would push DEAD over its cap: the whole lock reverts.
+        vm.expectRevert(
+            abi.encodeWithSelector(MaxWalletNoxa.MaxWalletReached.selector, DEAD, CAP + 100 ether, CAP)
+        );
+        m.lock(10_000 ether, bob);
+
+        // Escape hatch: zero the fee; inbound resumes immediately.
+        vm.prank(owner);
+        m.setBridgeFeeBps(0);
+        (, uint256 received) = m.lock(10_000 ether, bob);
+        assertEq(received, 10_000 ether);
+        assertEq(m.totalCollateral(), 10_000 ether);
     }
 
     // ---- fuzz: routing keeps shards under cap; collateral is conserved ----

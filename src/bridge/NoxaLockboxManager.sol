@@ -42,10 +42,17 @@ import {NoxaShardedBox} from "./NoxaShardedBox.sol";
 ///   the same transaction, with no swap, keeper, or relayer dependency (unlike
 ///   the LP-fee `NoxaFeeBurner` flywheel, which only earns on pool TRADING
 ///   volume). `Locked` emits the NET amount, so RH mints exactly the collateral
-///   that remains vaulted and the peg invariant is untouched. DEAD is excluded
-///   from the source wallet cap (verified — it already holds the team's 400K
-///   burn), so the skim transfer cannot cap-revert; if it ever did, setting the
-///   fee to 0 restores `lock` without a redeploy.
+///   that remains vaulted and the peg invariant is untouched. DEAD's exclusion
+///   from the source wallet cap is HARDCODED in NOXA's verified source (cap-doc
+///   §3(d); re-checked live 2026-07-23), so the skim cannot cap-revert and the
+///   exclusion cannot be revoked. If the skim somehow reverted anyway, the
+///   blast radius is every inbound lock (outbound unaffected) until the owner
+///   runs `setBridgeFeeBps(0)`, which restores `lock` without a redeploy
+///   (tested: brick-then-recover). Callers pass `minReceived` (3-arg `lock`)
+///   to pin their quoted net against a fee retune racing their tx. The fee is
+///   inbound-only, so it also sets an asymmetric peg band: wNOXA can trade up
+///   to the fee RICH before fresh bridging arbs it, while discounts still arb
+///   instantly via free outbound burns.
 ///
 /// Collateral invariant (relayer-enforced off-chain): `totalCollateral()` (the
 /// sum over all shards) + migrator escrow >= wNOXA.totalSupply(). Renounce stays
@@ -54,7 +61,8 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     using SafeERC20 for IERC20;
 
     /// @notice Standard burn sink on DBK — NOXA sent here leaves circulation.
-    /// Cap-excluded on the source token (it holds the team's 400K burn).
+    /// Cap-exclusion is hardcoded in the source token's verified code (cap-doc
+    /// §3(d)), so it cannot be revoked; it already holds the team's 400K burn.
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
     /// @notice Hard ceiling on `bridgeFeeBps` (2%) — bounds the owner's knob so
     /// the fee can never be turned into a confiscatory rake.
@@ -156,6 +164,7 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     error CannotRescueCollateral();
     error RenounceDisabled();
     error FeeTooHigh(uint256 bps, uint256 max);
+    error InsufficientReceived(uint256 received, uint256 minReceived);
 
     /// @param noxa_ DBK NOXA token.
     /// @param wrappedNoxa_ RH wNOXA this manager settles for (recorded only).
@@ -353,11 +362,14 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
     /// @notice Lock NOXA to bridge it to Robinhood Chain. Pulls from the caller,
     /// routes it into a shard with headroom (spawning a fresh shard if the active
     /// one is too full), skims the `bridgeFeeBps` burn fee straight to DEAD, and
-    /// emits a single global `Locked` with the NET amount — the relayer mints
+    /// emits a single global `Locked` with the NET amount: the relayer mints
     /// exactly what remains vaulted. Fee-on-transfer safe on both hops. The
     /// manager holds NOXA only within this call.
+    /// @dev Compatibility overload: the selector existing integrations already
+    /// call, with no receive floor (minReceived = 0). Prefer the 3-arg form,
+    /// which pins the quoted net.
     /// @return nonce Global inbound lock nonce consumed by the RH mint.
-    /// @return received NET amount custodied (post source-FoT, post burn fee) —
+    /// @return received NET amount custodied (post source-FoT, post burn fee):
     ///         the amount minted on RH.
     function lock(uint256 amount, address rhRecipient)
         external
@@ -365,9 +377,35 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
         whenNotPaused
         returns (uint256 nonce, uint256 received)
     {
+        return _lock(amount, rhRecipient, 0);
+    }
+
+    /// @notice Same as the 2-arg `lock`, plus a floor on the NET amount: reverts
+    /// `InsufficientReceived` if what would be minted on RH comes in below
+    /// `minReceived`. This is the caller's guard against a `setBridgeFeeBps`
+    /// retune landing between quote and inclusion (bounded by the 2% ceiling
+    /// regardless) and against any future source-token fee-on-transfer. The UI
+    /// passes exactly the net amount it quoted.
+    function lock(uint256 amount, address rhRecipient, uint256 minReceived)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 nonce, uint256 received)
+    {
+        return _lock(amount, rhRecipient, minReceived);
+    }
+
+    function _lock(uint256 amount, address rhRecipient, uint256 minReceived)
+        internal
+        returns (uint256 nonce, uint256 received)
+    {
         if (amount == 0) revert ZeroAmount();
         if (rhRecipient == address(0)) revert ZeroAddress();
         if (amount > maxBoxAmount) revert DepositExceedsBoxCap(amount, maxBoxAmount);
+
+        // CEI: consume the nonce before the token interactions below (the
+        // transfer-in and the fee skim).
+        nonce = lockNonce++;
 
         // Route on the REQUESTED amount (an upper bound on what the shard receives,
         // since a fee only shrinks it), then pull the caller's NOXA STRAIGHT INTO
@@ -394,8 +432,8 @@ contract NoxaLockboxManager is ReentrancyGuard, Ownable2Step, Pausable {
             NoxaShardedBox(box).drain(DEAD, burnFee);
             received -= burnFee;
         }
+        if (received < minReceived) revert InsufficientReceived(received, minReceived);
 
-        nonce = lockNonce++;
         emit Locked(nonce, msg.sender, rhRecipient, received);
         emit LockRouted(nonce, box);
         if (burnFee != 0) emit BridgeFeeBurned(nonce, burnFee);

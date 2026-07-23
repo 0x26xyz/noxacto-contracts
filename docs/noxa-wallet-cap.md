@@ -1,15 +1,17 @@
 # NOXA 25K wallet cap — bridge impact & custody design
 
 **Status: CONSTRAINT VERIFIED ON-CHAIN (§3, 2026-07-22). Max-WALLET branch
-confirmed; §4 is operative. wNOXA v3 (§4.3, mirrored cap + claim escrow) is
-BUILT — `src/bridge/WrappedNoxaV3.sol` — and awaiting deployment. The lockbox
-fleet (§4.1/§4.2) is designed but deliberately DEFERRED: one box's ~25K
-headroom already fits the largest possible EOA bridger; build it at whale #2.**
+confirmed; §4 is operative and SHIPPED: wNOXA v3 (§4.3, mirrored cap + claim
+escrow) is live at `0x4eA5eEfF…` and the sharded `NoxaLockboxManager` is live
+at `0x950F5F62…` with collateral migrated and relayer/UI repointed (verified
+on-chain 2026-07-23: `totalCollateral()` == wNOXA `totalSupply()` exactly).
+The live manager is the PRE-FEE cut; the bridge burn fee below ships only with
+a redeploy (see its deployment-coupling note).**
 
-Until the fleet ships, total bridged collateral is capped ~25K NOXA and we say
-so wherever the bridge is listed.
+Bridged capacity is now N x 25K (sharded); the old single-box ~25K ceiling no
+longer applies.
 
-Last updated: 2026-07-22.
+Last updated: 2026-07-23.
 
 ---
 
@@ -22,7 +24,7 @@ Last updated: 2026-07-22.
 | Team burned ~40% of supply (~2026-07-19) | Corroborated | OnchainLens; DEAD (excluded) holds 400K |
 | NOXA team is unreachable | Reported by operator | No exemption for our lockbox can be requested |
 | Wallets holding >25K exist | **Explained — all excluded contracts** | 85.8K = the live NOXA/WETH V3 pool (excluded); 50K + 50K = owner-excluded contracts (staking/farms/treasury); largest EOA holds 20,494. Supports the cap, does not refute it. |
-| This repo handles the cap | **wNOXA v3 built; fleet deferred** | `WrappedNoxaV3` mirrors the cap + escrows wedged inbound mints; custody is still one lockbox (~25K ceiling) until §4.1/§4.2 ship |
+| This repo handles the cap | **wNOXA v3 + sharded manager LIVE (2026-07-22)** | `WrappedNoxaV3` mirrors the cap + escrows wedged inbound mints; custody is the sharded `NoxaLockboxManager` at `0x950F5F62…` (pre-fee cut) |
 
 ## 1. Why this is critical
 
@@ -98,22 +100,45 @@ Hardened through two adversarial passes: `lock` pulls NOXA STRAIGHT into a shard
 addresses are absorbed as collateral (`spawnBoxes` owner escape hatch);
 `ownerDrainShard` recovers NOXA stray-sent to a retired shard; `rescueBoxToken`
 for non-NOXA. Relayer needs `LOCKBOX_IS_MANAGER=true` (reads `totalCollateral()`);
-UI likewise. NOT yet deployed. Known residual: the outbound recipient-cap wedge
+UI likewise. DEPLOYED 2026-07-22 at `0x950F5F62776b1eB988921C69376e4AD34b46BfFD`
+(the PRE-FEE cut; `bridgeFeeBps()` reverts on it), collateral migrated, old
+single boxes drained and retired. Known residual: the outbound recipient-cap wedge
 (a DBK recipient already near their own 25K cap) is still relayer policy — the
 relayer must skip-and-continue so one wedged burn doesn't head-of-line block.
 
-**Bridge burn fee (added 2026-07-22).** `lock` skims `bridgeFeeBps` of every
-custodied deposit (launch: 100 = 1%; owner-tunable, hard ceiling
-`MAX_BRIDGE_FEE_BPS` = 2%; 0 disables) from the shard straight to DEAD on DBK —
-real NOXA leaves circulation in the same transaction. This is the community
-buyback-and-burn, contract-enforced on BRIDGE volume; the LP-fee `NoxaFeeBurner`
-flywheel (which only earns on pool TRADING volume) remains as a complement.
-`Locked` emits the NET amount, so the relayer mints exactly the vaulted
-collateral and the peg invariant is unchanged. DEAD is cap-excluded on the
-source token (verified §1 — it holds the team's 400K burn), so the skim cannot
-cap-revert; if it ever did, `setBridgeFeeBps(0)` restores `lock` without a
-redeploy. Relayer/UI: quote the net amount ("you will receive X on RH, 1% burn
-fee") — the `Locked` event needs no decoder change.
+**Bridge burn fee (added 2026-07-22; hardened 2026-07-23).** `lock` skims
+`bridgeFeeBps` of every custodied deposit (launch: 100 = 1%; owner-tunable,
+hard ceiling `MAX_BRIDGE_FEE_BPS` = 2%; 0 disables) from the shard straight to
+DEAD on DBK: real NOXA leaves circulation in the same transaction. This is the
+community buyback-and-burn, contract-enforced on BRIDGE volume; the LP-fee
+`NoxaFeeBurner` flywheel (which only earns on pool TRADING volume) remains as
+a complement. `Locked` emits the NET amount, so the relayer mints exactly the
+vaulted collateral and the peg invariant is unchanged (no decoder change).
+Operational notes:
+
+- **Deployment coupling.** The LIVE manager (`0x950F5F62…`, holding the
+  collateral since 2026-07-22) predates the fee: `bridgeFeeBps()` reverts on
+  it. Turning the fee on is NOT a knob on the live contract; it means
+  deploying this cut, moving collateral (owner-drain old shard, fund the new
+  manager's shard), and repointing relayer (`LOCKBOX_ADDRESS`) and UI
+  (`VITE_LOCKBOX`).
+- **Why the skim cannot cap-revert.** DEAD's exclusion is hardcoded in NOXA's
+  verified source (§3(d)), not owner-granted, so nobody can revoke it;
+  re-checked live 2026-07-23 (`isExcludedFromMaxWallet(DEAD)` = true). If the
+  skim somehow reverted anyway, the failure is total: every inbound lock
+  reverts (outbound unaffected) until the Safe runs `setBridgeFeeBps(0)`.
+  That brick-then-recover path is tested.
+- **Quote protection.** `lock(amount, rhRecipient, minReceived)` reverts
+  `InsufficientReceived` if the net mintable amount lands below the quote
+  (e.g. a fee retune racing the user's tx). The 2-arg `lock` stays for
+  selector-compat with existing integrations and passes 0. The UI quotes net
+  of fee (reads `bridgeFeeBps()`, treating a revert as fee 0 on older cuts)
+  and passes its quote as the floor.
+- **Peg band.** The fee is inbound-only, so it sets an asymmetric band: wNOXA
+  can trade up to `bridgeFeeBps` RICH to NOXA before fresh bridging arbs it,
+  while any discount still arbs instantly via free outbound burns. "Backed
+  1:1" stays true (every wNOXA fully collateralised); "swaps 1:1 both ways"
+  does not once the fee is non-zero.
 
 ### 4.1 `NoxaLockboxFactory` (DBK) — SUPERSEDED by NoxaLockboxManager (built)
 
